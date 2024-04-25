@@ -1,0 +1,287 @@
+#!/bin/bash
+
+#@ Prepare
+#@ .general-attributes
+workDir=$PWD
+
+declare -A repoInfo
+
+#@ .aux-functions
+function error() {
+    echo -e '\033[31m'"Error"'\033[0m' "$1"
+    exit 101
+}
+function success() {
+    echo -e '\033[32m'"$1"'\033[0m'
+}
+function progress() {
+    echo -e '\033[33m-- '"($(date '+%Y/%m/%d %H:%M:%S')) ""$1"'\033[0m'
+}
+
+#@ .usage
+usage() {
+ echo "
+gits is used to navigate a set of selected repositories, 
+REQUIRES a .gitsconfig with LF terminator in working directory
+
+// Usage:
+
+gits [options] <action> [action-params]
+
+[options]
+    ● -h
+        show usage
+    ● -r <repository-list> | --repos <repository-list>
+        set target repository list, separator is ","
+<action>
+    ● status
+        show git status for all repositories, shown as table
+    ● checkout
+        checkout to desired branch for each repositoroy
+    ● pull
+        pull for each repository
+    ● clone
+        clone all missed repositories
+    ● add <nameurl>
+        add a new repository by name or url
+"
+}
+
+
+
+#@ .Arguments
+target_repos=
+
+ARGS=$(getopt -o hr: --long help,repos: -n "$0" -- "$@")
+eval set -- "$ARGS"
+while true; do
+    case "$1" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    -r | --repos)
+        IFS=, read -ra target_repos <<<$2
+        shift 2
+        ;;
+    --)
+        shift
+        break
+        ;;
+    *)
+        echo "Unknown option $1"
+        usage
+        exit 200
+        ;;
+    esac
+done
+
+#@ .check-config
+if [[ ! -e $workDir/.gitsconfig ]]; then
+    usage
+    error "cannot find .gitconfig in workding directory=$workDir"
+fi
+if [[ $(file $workDir/.gitsconfig) =~ "CRLF" ]]; then
+    usage
+    error ".gitconfig cannot have CRLF line terminators, use dos2unix"
+fi
+
+#@ Main
+action=$1
+if [[ -n "$target_repos" ]]; then
+    nRepos=${#target_repos[@]}
+else
+    nRepos=$(grep -P '^\(\[.*\)' $workDir/.gitsconfig | wc -l)
+fi
+
+if [[ $action == status ]]; then
+    repoStatus='repo\tbranch\tclean\tchanged\tuntrack\n----\t------\t-----\t-------\t-------'
+    i=1
+    t0=$SECONDS
+    while read -r Line; do
+        if [[ ! $Line =~ ^\(\[.*\)$ ]]; then #@ exp | only focus on legal index array
+            continue
+        fi
+        eval "repoInfo=$Line"
+        if [[ -n "${target_repos}" && ! " ${target_repos[*]} " =~ " ${repoInfo[name]} " ]]; then
+            continue
+        fi
+        ((deltaSeconds = SECONDS - t0)) || true
+        echo -ne "(\033[33m$i/$nRepos\033[0m) $deltaSeconds s | processing ${repoInfo[name]}              \r"
+        ((i++))
+
+        repoStatus+="\n${repoInfo[name]}"
+
+        if [[ -z ${repoInfo[path]} ]]; then
+            repo_path=$workDir/${repoInfo[name]}
+        else
+            repo_path=$workDir/${repoInfo[path]}
+        fi
+
+        if [[ ! -e $repo_path ]]; then
+            repoStatus+="\t\033[31m×\033[0m"
+            continue
+        fi
+
+        cd $repo_path
+        status=$(git status)
+        branch=$(echo $status | grep -Po 'On branch [^ ]* ' | cut -d' ' -f3)
+        if [[ -z "$branch" ]]; then
+            repoStatus+="\t\033[31m?\033[0m"
+            continue
+        fi
+        if [[ ${repoInfo[branch]} != auto && ${repoInfo[branch]} != $branch ]]; then
+            repoStatus+="\t\033[31m${branch}\033[0m"
+        else
+            repoStatus+="\t$branch"
+        fi
+
+        flag_changes='-'
+        flag_untrack='-'
+        flag_clean='\033[32m√\033[0m'
+        if [[ -n $(echo $status | grep 'Changes to be commited:') || -n $(echo $status | grep 'Changes not staged for commit:') ]]; then
+            flag_changes='\033[31m√\033[0m'
+            flag_clean='-'
+        fi
+        if [[ -n $(echo $status | grep 'Untracked files:') ]]; then
+            flag_untrack='\033[31m√\033[0m'
+            flag_clean='-'
+        fi
+        repoStatus+="\t${flag_clean}\t${flag_changes}\t${flag_untrack}\n"
+    done <$workDir/.gitsconfig
+    echo
+    echo
+    echo -e $repoStatus | column -t
+elif [[ $action == "pull" || $action == "checkout" ]]; then
+    i=1
+    t0=$SECONDS
+    while read -r Line; do
+        if [[ ! $Line =~ ^\(\[.*\)$ ]]; then #@ exp | only focus on legal index array
+            continue
+        fi
+        eval "repoInfo=$Line"
+        ((deltaSeconds = SECONDS - t0)) || true #@ exp | Make it compatible for set -e
+        echo -ne "(\033[33m$i/$nRepos\033[0m) $deltaSeconds s | processing ${repoInfo[name]}              \r"
+        ((i++))
+
+        repoStatus+="\n${repoInfo[name]}"
+        if [[ -n "${target_repos}" && ! " ${target_repos[*]} " =~ " ${repoInfo[name]} " ]]; then
+            continue
+        fi
+        if [[ -z ${repoInfo[path]} ]]; then
+            repo_path=$workDir/${repoInfo[name]}
+        else
+            repo_path=$workDir/${repoInfo[path]}
+        fi
+
+        if [[ ! -e $repo_path ]]; then
+            git clone ${repoInfo[url]} $repo_path
+        fi
+
+        cd $repo_path
+        status=$(git status)
+
+        branch=$(echo $status | grep -Po 'On branch [^ ]* ' | cut -d' ' -f3)
+        if [[ ${repoInfo[branch]} != auto && ${repoInfo[branch]} != $branch ]]; then
+            if [[ -n $(echo $status | grep 'Changes to be commited:') || -n $(echo $status | grep 'Untracked files:') || -n $(echo $status | grep 'Changes not staged for commit:') ]]; then
+                error "This git repository is not clean"
+            fi
+            git checkout ${repoInfo[branch]} >&/dev/null
+            if [[ $? != 0 ]]; then
+                echo
+                error "Cannot checkout ${repoInfo[branch]} in ${repoInfo[name]}"
+            fi
+        fi
+
+        if [[ $action == "pull" ]]; then
+            git pull ${repoInfo[remote]} $branch:$branch >&/dev/null
+            if [[ $? != 0 ]]; then
+                echo
+                error "Failed to pull in ${repoInfo[name]}"
+            fi
+        fi
+
+    done <$workDir/.gitsconfig
+    echo
+    success "Checkout all repositories"
+elif [[ $action == "clone" ]]; then
+    while read -r Line; do
+        if [[ ! $Line =~ ^\(\[.*\)$ ]]; then #@ exp | only focus on legal index array
+            continue
+        fi
+        eval "repoInfo=$Line"
+        if [[ -n "${target_repos}" && ! " ${target_repos[*]} " =~ " ${repoInfo[name]} " ]]; then
+            continue
+        fi
+
+        repoStatus+="\n${repoInfo[name]}"
+        if [[ -z ${repoInfo[path]} ]]; then
+            repo_path=$workDir/${repoInfo[name]}
+        else
+            repo_path=$workDir/${repoInfo[path]}
+        fi
+
+        if [[ ! -e $repo_path ]]; then
+            echo "cloning ${repoInfo[name]}"
+            cd $workDir
+            git clone ${repoInfo[url]} $repo_path
+            cd $repo_path
+            if [[ ${repoInfo[branch]} != "auto" ]]; then
+                git checkout ${repoInfo[branch]}
+                if [[ $? != 0 ]]; then
+                    error "Failed to checkout ${repoInfo[branch]} for ${repoInfo[name]}"
+                fi
+            fi
+        fi
+    done <$workDir/.gitsconfig
+
+    success "Clone missed repositories"
+elif [[ $action == "add" ]]; then
+    if [[ -z $2 ]]; then
+        error "Require target name/url"
+    fi
+    nameurl=$2
+    if [[ "$2" =~ / ]]; then
+        url=$nameurl
+        name=${nameurl##*/}
+        name=${name%.git}
+    else
+        name=$nameurl
+        url=
+    fi
+
+    while read -r Line; do
+        if [[ ! $Line =~ ^\(\[.*\)$ ]]; then #@ exp | only focus on legal index array
+            continue
+        fi
+        eval "repoInfo=$Line"
+        if [[ "${repoInfo[name]}" == $name ]]; then
+            if [[ -n "$url" && "$url" != "$repoInfo{url}" ]]; then
+                error "The same name but different url"
+            fi
+            echo "$name already in $workDir/.gitsconfig"
+            exit 0
+        fi
+    done <$workDir/.gitsconfig
+
+    if [[ -e $name ]]; then
+        cd $name
+        url2=$(git remote -v | head -n 1 | cut -f2 | cut -d' ' -f1)
+        if [[ $? != 0 ]]; then
+            error "Failed to get git remote status"
+        fi
+        remote=$(git remote -v | head -n 1 | cut -f1)
+        if [[ -n "$url" && "$url" != "$url2" ]]; then
+            error "The same name but different url"
+        fi
+        echo "([name]=$name [path]=./$name [url]=$url2 [branch]=auto [remote]=$remote)" >>$workDir/.gitsconfig
+    else
+        if [[ -z $url ]]; then
+            error "Cannot add a non-existed repo without url"
+        fi
+        echo "([name]=$name [path]=./$name [url]=$url [branch]=auto [remote]=origin)" >>$workDir/.gitsconfig
+    fi
+
+else
+    error "NotImplemented for action:$action"
+fi
