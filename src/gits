@@ -151,7 +151,12 @@ if [[ $action == status ]]; then
     done <$workDir/.gitsconfig
     echo
     echo
-    echo -e $repoStatus | column -t
+    colver=$(column --version | grep -Po '\d+\.\d+\.\d+' | cut -d. -f2)
+    if [[ "$colver" -gt 34 ]]; then
+        echo -e $repoStatus | column -t
+    else
+        echo -e $repoStatus
+    fi
 elif [[ $action == "pull" || $action == "checkout" ]]; then
     i=1
     t0=$SECONDS
